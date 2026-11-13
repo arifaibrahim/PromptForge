@@ -1,4 +1,3 @@
-```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -166,8 +165,34 @@ button {
     transition: 0.2s;
 }
 
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+}
+
 .new-chat-btn:hover {
     background: var(--surface-hover);
+}
+
+.clear-chat-btn {
+    background: transparent;
+    border: 1px solid rgba(239,68,68,0.45);
+    color: #fca5a5;
+    padding: 9px 12px;
+    border-radius: 9px;
+    font-size: 12px;
+    transition: 0.2s;
+}
+
+.clear-chat-btn:hover {
+    background: rgba(239,68,68,0.12);
+    border-color: var(--red);
+}
+
+.clear-chat-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 
@@ -830,9 +855,14 @@ button:disabled {
         font-size: 9px;
     }
 
-    .new-chat-btn {
-        padding: 8px 10px;
-        font-size: 10px;
+    .new-chat-btn,
+    .clear-chat-btn {
+        padding: 8px 9px;
+        font-size: 9px;
+    }
+
+    .header-actions {
+        gap: 6px;
     }
 
     .status {
@@ -966,14 +996,15 @@ button:disabled {
         </div>
 
 
-        <button
-            class="new-chat-btn"
-            id="newChatBtn"
-            type="button">
-
-            + New Prompt
-
-        </button>
+        <div class="header-actions">
+            <button class="new-chat-btn" id="newChatBtn" type="button">
+                + New Prompt
+            </button>
+            <button class="clear-chat-btn" id="clearChatBtn" type="button"
+                    title="Permanently delete all saved chat history">
+                Clear All Chats
+            </button>
+        </div>
 
     </div>
 
@@ -1211,6 +1242,9 @@ const sendBtn =
 const newChatBtn =
     document.getElementById("newChatBtn");
 
+const clearChatBtn =
+    document.getElementById("clearChatBtn");
+
 const codingToggle =
     document.getElementById("codingToggle");
 
@@ -1262,6 +1296,13 @@ function saveHistory() {
 
     }
 
+}
+
+
+function addHistoryEntry(role, content) {
+    if (!content || typeof content !== "string") return;
+    conversationHistory.push({ role, content });
+    saveHistory();
 }
 
 
@@ -1984,6 +2025,7 @@ function setProcessingState(value) {
     messageInput.disabled = value;
 
     newChatBtn.disabled = value;
+    clearChatBtn.disabled = value;
 
     modelButtons.forEach(button => {
 
@@ -2143,7 +2185,8 @@ async function sendMessage() {
 
             addMessage(
                 "assistant",
-                data.assistant_message || "An error occurred."
+                data.assistant_message || "An error occurred.",
+                false
             );
 
             return;
@@ -2157,17 +2200,16 @@ async function sendMessage() {
 
         if (data.status === "needs_clarification") {
 
-            const parent =
-                addMessage(
-                    "assistant",
-                    data.assistant_message
-                );
+            const questions = Array.isArray(data.questions) ? data.questions : [];
+            const questionHistory =
+                (data.assistant_message || "I need clarification to refine your prompt.") +
+                (questions.length
+                    ? "\\n\\nClarification questions:\\n" +
+                      questions.map((question, index) => `${index + 1}. ${question}`).join("\\n")
+                    : "");
 
-
-            displayQuestions(
-                parent,
-                data.questions
-            );
+            const parent = addMessage("assistant", questionHistory);
+            displayQuestions(parent, questions);
 
             return;
 
@@ -2192,18 +2234,19 @@ async function sendMessage() {
             }
 
 
-            const parent =
-                addMessage(
-                    "assistant",
-                    data.assistant_message ||
-                    "Your refined prompt is ready."
-                );
-
-
-            displayFinalPrompt(
-                parent,
-                data
+            const parent = addMessage(
+                "assistant",
+                data.assistant_message || "Your refined prompt is ready.",
+                false
             );
+
+            // Preserve the complete prompt for follow-up refinement requests.
+            addHistoryEntry(
+                "assistant",
+                "PREVIOUS REFINED PROMPT (instruction prompt only):\\n" + data.final_prompt
+            );
+
+            displayFinalPrompt(parent, data);
 
         }
 
@@ -2313,12 +2356,9 @@ newChatBtn.addEventListener(
         if (!confirmed) return;
 
 
-        // Preserve the existing saved history.
-
-        // Start a new in-memory session.
-
+        // Start a new prompt-refinement session.
         conversationHistory = [];
-
+        saveHistory();
 
         chatContainer.innerHTML = "";
 
@@ -2328,9 +2368,8 @@ newChatBtn.addEventListener(
         addMessage(
             "assistant",
             "Welcome to PromptForge Offline!\n\n" +
-            "Describe what you want to accomplish. " +
-            "I'll help you refine your instructions while " +
-            "preserving your original meaning and requirements.",
+            "Describe the task you want to turn into a prompt. " +
+            "I will only engineer and refine the prompt; I will never perform the task itself.",
             false
         );
 
@@ -2344,7 +2383,48 @@ newChatBtn.addEventListener(
 
 
 /* =====================================================
-   21. RESTORE CHAT HISTORY
+   21. CLEAR ALL SAVED CHATS
+===================================================== */
+
+clearChatBtn.addEventListener("click", () => {
+    if (isProcessing) return;
+
+    const confirmed = confirm(
+        "Permanently delete all saved PromptForge chat history on this browser?\\n\\n" +
+        "This removes the current conversation and all saved PromptForge chats. " +
+        "Your model selection and Coding Guidelines setting will remain unchanged. " +
+        "This action cannot be undone."
+    );
+
+    if (!confirmed) return;
+
+    try {
+        Object.keys(localStorage).forEach(key => {
+            if (key.startsWith("promptforge_chat_history_")) {
+                localStorage.removeItem(key);
+            }
+        });
+        localStorage.removeItem(STORAGE_KEY);
+    } catch (error) {
+        console.error("Unable to clear saved PromptForge chats:", error);
+        alert("PromptForge could not delete the saved chat history. Check browser storage permissions.");
+        return;
+    }
+
+    conversationHistory = [];
+    chatContainer.innerHTML = "";
+    addMessage(
+        "assistant",
+        "All saved chats have been cleared. Start a new prompt whenever you're ready.",
+        false
+    );
+    messageInput.value = "";
+    messageInput.focus();
+});
+
+
+/* =====================================================
+   22. RESTORE CHAT HISTORY
 ===================================================== */
 
 function restoreChat() {
@@ -2359,9 +2439,8 @@ function restoreChat() {
         addMessage(
             "assistant",
             "Welcome to PromptForge Offline!\n\n" +
-            "Describe what you want to accomplish. " +
-            "I'll help you refine your instructions while " +
-            "preserving your original meaning and requirements.",
+            "Describe the task you want to turn into a prompt. " +
+            "I will only engineer and refine the prompt; I will never perform the task itself.",
             false
         );
 
@@ -2384,7 +2463,7 @@ function restoreChat() {
 
 
 /* =====================================================
-   22. HEALTH CHECK
+   23. HEALTH CHECK
 ===================================================== */
 
 async function checkHealth() {
@@ -2487,4 +2566,3 @@ initializeApplication();
 
 </body>
 </html>
-```

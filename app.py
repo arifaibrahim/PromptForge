@@ -1,988 +1,327 @@
 """
-PromptForge Offline
-AI-Powered Prompt Engineering and Optimization Assistant
+PromptForge Offline — Flask application entry point.
 
-Main responsibilities:
-1. Initialize Flask.
-2. Serve the frontend.
-3. Check local Ollama and PDF availability.
-4. Validate incoming chat requests.
-5. Communicate with prompt_engine.py.
-6. Return standardized JSON responses.
-7. Handle errors safely.
+Responsibilities:
+- Serve the existing templates/index.html interface.
+- Validate chat requests.
+- Check local Ollama and the permanent knowledge_base.json.
+- Call prompt_engine.process_message().
+- Return the response contract expected by the existing frontend.
 
-All AI inference is performed locally through Ollama.
+No online GPT/Gemini APIs are used. Ollama is accessed only on localhost.
 """
 
-import os
+from __future__ import annotations
+
 import logging
+import os
 from pathlib import Path
+from typing import Any
 
 import requests
 from flask import Flask, jsonify, render_template, request
-from pypdf import PdfReader
 
-from prompt_engine import process_message
-
-
-# ============================================================
-# 1. APPLICATION CONFIGURATION
-# ============================================================
+from prompt_engine import (
+    get_knowledge_base_status,
+    process_message,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
-KNOWLEDGE_DIR = BASE_DIR / "knowledge"
+TEMPLATE_DIR = BASE_DIR / "templates"
+if not (TEMPLATE_DIR / "index.html").is_file() and (BASE_DIR / "index.html").is_file():
+    TEMPLATE_DIR = BASE_DIR
 
 OLLAMA_BASE_URL = os.environ.get(
-    "OLLAMA_BASE_URL",
-    "http://127.0.0.1:11434"
+    "OLLAMA_BASE_URL", "http://127.0.0.1:11434"
 ).rstrip("/")
-
-OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "").strip()
 
-LOCAL_LLM_MODEL = os.environ.get(
-    "LOCAL_LLM_MODEL",
-    "llama3.2"
-)
+SUPPORTED_MODELS = {"gpt_luna", "gemini_flash"}
+SUPPORTED_ROLES = {"user", "assistant"}
 
-OLLAMA_TIMEOUT = int(
-    os.environ.get("OLLAMA_TIMEOUT", "120")
-)
-
-# Expected knowledge-base documents and page counts.
-REQUIRED_PDFS = {
-    "general_guidelines.pdf": 33,
-    "gpt_luna_guidelines.pdf": 47,
-    "gemini_flash_guidelines.pdf": 43,
-    "coding_guidelines.pdf": 40
-}
-
-# Supported target models.
-SUPPORTED_MODELS = {
-    "gpt_luna",
-    "gemini_flash"
-}
-
-# Supported conversation roles.
-SUPPORTED_ROLES = {
-    "user",
-    "assistant"
-}
-
-# Maximum accepted request sizes.
 MAX_MESSAGE_LENGTH = 50000
-MAX_HISTORY_MESSAGES = 100
-MAX_HISTORY_CONTENT_LENGTH = 50000
+MAX_HISTORY_MESSAGES = 40
+MAX_HISTORY_CONTENT_LENGTH = 30000
 
-# Configure logging.
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
-logger = logging.getLogger("PromptForge")
-
-
-# ============================================================
-# 2. FLASK INITIALIZATION
-# ============================================================
+LOGGER = logging.getLogger("PromptForge.App")
 
 app = Flask(
     __name__,
-    template_folder=str(BASE_DIR / "templates")
+    template_folder=str(TEMPLATE_DIR),
 )
-
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 
-# ============================================================
-# 3. STANDARDIZED ERROR RESPONSE
-# ============================================================
-
-def error_response(message, status_code=400):
-    """
-    Returns the standardized error response.
-    """
-
+def _error(message: str, status_code: int = 400):
     return jsonify({
         "status": "error",
-        "assistant_message": str(message)
+        "assistant_message": str(message),
     }), status_code
 
 
-# ============================================================
-# 4. HEALTH CHECK HELPERS
-# ============================================================
-
-def check_ollama_connection():
-    """
-    Checks whether the local Ollama service is running.
-
-    Returns:
-        dict: Connection status and information.
-    """
-
+def _check_ollama() -> dict[str, Any]:
     try:
-        response = requests.get(
-            OLLAMA_TAGS_URL,
-            timeout=5
-        )
-
+        response = requests.get(OLLAMA_TAGS_URL, timeout=5)
         response.raise_for_status()
-
-        return {
-            "available": True,
-            "message": "Ollama is running."
-        }
-
+        return {"available": True, "message": "Ollama is running."}
     except requests.exceptions.ConnectionError:
-
         return {
             "available": False,
-            "message": (
-                "Cannot connect to Ollama. "
-                "Start the local Ollama service."
-            )
+            "message": "Cannot connect to Ollama. Start the local Ollama service.",
         }
-
     except requests.exceptions.Timeout:
-
-        return {
-            "available": False,
-            "message": "Ollama connection timed out."
-        }
-
+        return {"available": False, "message": "Ollama health check timed out."}
     except requests.exceptions.RequestException as exc:
-
-        logger.error("Ollama health check failed: %s", exc)
-
-        return {
-            "available": False,
-            "message": "Ollama service is unavailable."
-        }
+        LOGGER.warning("Ollama health check failed: %s", exc)
+        return {"available": False, "message": "Ollama service is unavailable."}
 
 
-def check_local_model():
-    """
-    Checks whether the configured local model
-    is installed in Ollama.
-
-    Returns:
-        dict: Model availability information.
-    """
-
-    if not LOCAL_LLM_MODEL.strip():
-
+def _check_local_model() -> dict[str, Any]:
+    if not LOCAL_LLM_MODEL:
         return {
             "available": False,
             "model": None,
-            "message": "LOCAL_LLM_MODEL is not configured."
+            "message": "LOCAL_LLM_MODEL is not configured.",
         }
 
     try:
-
-        response = requests.get(
-            OLLAMA_TAGS_URL,
-            timeout=5
-        )
-
+        response = requests.get(OLLAMA_TAGS_URL, timeout=5)
         response.raise_for_status()
-
         data = response.json()
+        installed = set()
+        for item in data.get("models", []):
+            if item.get("name"):
+                installed.add(item["name"])
+            if item.get("model"):
+                installed.add(item["model"])
 
-        installed_models = data.get("models", [])
-
-        installed_names = [
-            model.get("name", "")
-            for model in installed_models
-        ]
-
-        installed_names.extend(
-            model.get("model", "")
-            for model in installed_models
-        )
-
-        configured_name = LOCAL_LLM_MODEL.strip()
-
-        # Match exact names or the implicit :latest tag.
-        possible_names = {
-            configured_name,
-            f"{configured_name}:latest"
-        }
-
-        model_available = any(
-            name in possible_names
-            for name in installed_names
-        )
-
-        if model_available:
-
-            return {
-                "available": True,
-                "model": configured_name,
-                "message": "Configured local model is installed."
-            }
-
+        configured = LOCAL_LLM_MODEL
+        alternatives = {configured, f"{configured}:latest"}
+        available = bool(installed.intersection(alternatives))
         return {
-            "available": False,
-            "model": configured_name,
+            "available": available,
+            "model": configured,
             "message": (
-                f"Model '{configured_name}' is not installed "
-                "in Ollama."
-            )
+                "Configured local model is installed."
+                if available
+                else f"Model '{configured}' is not installed in Ollama."
+            ),
         }
-
-    except (
-        requests.exceptions.RequestException,
-        ValueError
-    ) as exc:
-
-        logger.error("Local model check failed: %s", exc)
-
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        LOGGER.warning("Could not verify local Ollama model: %s", exc)
         return {
             "available": False,
             "model": LOCAL_LLM_MODEL,
-            "message": "Unable to verify the local model."
+            "message": "Unable to verify the configured local model.",
         }
 
 
-def check_knowledge_base():
-    """
-    Checks all four required PDF documents.
+def _validate_chat_payload(data: Any):
+    if not isinstance(data, dict):
+        return None, "Request body must be a JSON object."
 
-    Validates:
-    - File availability.
-    - PDF readability.
-    - Expected page count.
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None, "Please enter a message before sending."
+    message = message.strip()
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return None, f"Message exceeds the {MAX_MESSAGE_LENGTH}-character limit."
 
-    Does not modify the original PDFs.
+    target_model = data.get("target_model")
+    if target_model not in SUPPORTED_MODELS:
+        return None, "Select either GPT-5.6 Luna or Gemini 3.8 Flash."
 
-    Returns:
-        dict: Knowledge-base validation results.
-    """
+    coding_mode = data.get("coding_mode")
+    if type(coding_mode) is not bool:
+        return None, "coding_mode must be true or false."
 
-    results = {}
-    all_available = True
+    history = data.get("history", [])
+    if not isinstance(history, list):
+        return None, "Conversation history must be a list."
+    if len(history) > MAX_HISTORY_MESSAGES:
+        history = history[-MAX_HISTORY_MESSAGES:]
 
-    for filename, expected_pages in REQUIRED_PDFS.items():
-
-        pdf_path = KNOWLEDGE_DIR / filename
-
-        if not pdf_path.exists():
-
-            results[filename] = {
-                "available": False,
-                "readable": False,
-                "expected_pages": expected_pages,
-                "actual_pages": 0,
-                "message": "PDF file is missing."
-            }
-
-            all_available = False
-            continue
-
-        try:
-
-            if not pdf_path.is_file():
-
-                raise ValueError("Path is not a regular file.")
-
-            reader = PdfReader(
-                str(pdf_path),
-                strict=False
-            )
-
-            actual_pages = len(reader.pages)
-
-            # Attempt to access each page's extracted text.
-            extracted_pages = 0
-
-            for page in reader.pages:
-
-                page.extract_text()
-
-                extracted_pages += 1
-
-            readable = (
-                actual_pages > 0
-                and extracted_pages == actual_pages
-            )
-
-            correct_page_count = (
-                actual_pages == expected_pages
-            )
-
-            valid = readable and correct_page_count
-
-            if not readable:
-
-                message = "PDF content could not be fully read."
-
-            elif not correct_page_count:
-
-                message = (
-                    f"Expected {expected_pages} pages, "
-                    f"but found {actual_pages} pages."
-                )
-
-            else:
-
-                message = "PDF is available and readable."
-
-            results[filename] = {
-                "available": True,
-                "readable": readable,
-                "expected_pages": expected_pages,
-                "actual_pages": actual_pages,
-                "message": message
-            }
-
-            if not valid:
-                all_available = False
-
-        except Exception as exc:
-
-            logger.error(
-                "PDF validation failed for %s: %s",
-                filename,
-                exc
-            )
-
-            results[filename] = {
-                "available": True,
-                "readable": False,
-                "expected_pages": expected_pages,
-                "actual_pages": 0,
-                "message": "PDF validation or extraction failed."
-            }
-
-            all_available = False
+    clean_history = []
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            return None, f"Invalid history entry at position {index}."
+        role = item.get("role")
+        content = item.get("content")
+        if role not in SUPPORTED_ROLES or not isinstance(content, str):
+            return None, f"Invalid role or content in history entry {index}."
+        if len(content) > MAX_HISTORY_CONTENT_LENGTH:
+            return None, f"History entry {index} is too long."
+        clean_history.append({"role": role, "content": content})
 
     return {
-        "available": all_available,
-        "documents": results
-    }
+        "message": message,
+        "history": clean_history,
+        "target_model": target_model,
+        "coding_mode": coding_mode,
+    }, None
 
 
-# ============================================================
-# 5. RESPONSE CONTRACT VALIDATION
-# ============================================================
-
-def validate_engine_response(result):
-    """
-    Validates the dictionary returned by prompt_engine.py.
-
-    Prevents malformed or incomplete responses from being
-    presented as successfully generated prompts.
-    """
-
+def _validate_engine_result(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
-
-        raise ValueError(
-            "Prompt engine returned an invalid response."
-        )
+        raise ValueError("Prompt engine returned a non-object response.")
 
     status = result.get("status")
-
-    # --------------------------------------------------------
-    # ERROR RESPONSE
-    # --------------------------------------------------------
-
     if status == "error":
+        message = result.get("assistant_message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Prompt engine returned an invalid error response.")
+        return {"status": "error", "assistant_message": message}
 
-        assistant_message = result.get("assistant_message")
-
-        if not isinstance(assistant_message, str):
-
-            raise ValueError(
-                "Prompt engine returned an invalid error response."
-            )
-
-        return {
-            "status": "error",
-            "assistant_message": assistant_message
-        }
-
-    # --------------------------------------------------------
-    # CLARIFICATION RESPONSE
-    # --------------------------------------------------------
+    common = {
+        "assumptions": result.get("assumptions", []),
+        "applied_guidelines": result.get("applied_guidelines", []),
+        "suggested_settings": result.get("suggested_settings"),
+        "guideline_traceability": result.get("guideline_traceability"),
+    }
 
     if status == "needs_clarification":
-
         assistant_message = result.get("assistant_message")
         questions = result.get("questions")
-
         if not isinstance(assistant_message, str) or not assistant_message.strip():
-
-            raise ValueError(
-                "Clarification response is missing its message."
-            )
-
-        if not isinstance(questions, list):
-
-            raise ValueError(
-                "Clarification questions must be a list."
-            )
-
-        if not all(
-            isinstance(question, str) and question.strip()
-            for question in questions
-        ):
-
-            raise ValueError(
-                "Clarification response contains invalid questions."
-            )
-
+            raise ValueError("Clarification response has no assistant message.")
+        if not isinstance(questions, list) or not questions:
+            raise ValueError("Clarification response has no questions.")
+        if not all(isinstance(question, str) and question.strip() for question in questions):
+            raise ValueError("Clarification response contains an invalid question.")
         return {
             "status": "needs_clarification",
             "assistant_message": assistant_message,
             "questions": questions,
             "final_prompt": None,
-            "assumptions": result.get("assumptions", []),
-            "applied_guidelines": result.get(
-                "applied_guidelines", []
-            ),
-            "suggested_settings": result.get(
-                "suggested_settings"
-            )
+            **common,
         }
 
-    # --------------------------------------------------------
-    # FINAL PROMPT RESPONSE
-    # --------------------------------------------------------
-
     if status == "prompt_ready":
-
         assistant_message = result.get("assistant_message")
         final_prompt = result.get("final_prompt")
-
         if not isinstance(assistant_message, str) or not assistant_message.strip():
-
-            raise ValueError(
-                "Final response is missing its assistant message."
-            )
-
+            raise ValueError("Prompt-ready response has no assistant message.")
         if not isinstance(final_prompt, str) or not final_prompt.strip():
-
-            raise ValueError(
-                "Final prompt is empty or invalid."
-            )
-
+            raise ValueError("Prompt-ready response has an empty final prompt.")
+        if not isinstance(common["applied_guidelines"], list):
+            raise ValueError("Applied guideline identifiers must be a list.")
+        trace = common["guideline_traceability"]
+        if not isinstance(trace, dict):
+            raise ValueError("Prompt-ready response has no guideline traceability report.")
+        if trace.get("coverage_status") != "complete_for_retrieval_policy_and_both_verification_passes":
+            raise ValueError("Guideline traceability did not confirm both verification passes.")
         return {
             "status": "prompt_ready",
             "assistant_message": assistant_message,
             "questions": [],
             "final_prompt": final_prompt,
-            "assumptions": result.get("assumptions", []),
-            "applied_guidelines": result.get(
-                "applied_guidelines", []
-            ),
-            "suggested_settings": result.get(
-                "suggested_settings"
-            )
+            **common,
         }
 
-    # --------------------------------------------------------
-    # UNKNOWN RESPONSE
-    # --------------------------------------------------------
+    raise ValueError(f"Unknown prompt-engine status: {status!r}")
 
-    raise ValueError(
-        f"Unknown prompt engine response status: {status}"
-    )
-
-
-# ============================================================
-# 6. FRONTEND ROUTE
-# ============================================================
 
 @app.route("/", methods=["GET"])
 def index():
-    """
-    Serves the main chatbot interface.
-    """
-
     return render_template("index.html")
 
 
-# ============================================================
-# 7. HEALTH CHECK ROUTE
-# ============================================================
-
 @app.route("/api/health", methods=["GET"])
 def health():
-    """
-    Checks the complete local application environment.
+    ollama = _check_ollama()
+    model = _check_local_model() if ollama["available"] else {
+        "available": False,
+        "model": LOCAL_LLM_MODEL or None,
+        "message": "Cannot verify the model because Ollama is unavailable.",
+    }
+    knowledge = get_knowledge_base_status()
 
-    Checks:
-    - Flask application.
-    - Ollama connection.
-    - Configured local model.
-    - Four required PDF documents.
-    """
-
-    ollama_status = check_ollama_connection()
-
-    if ollama_status["available"]:
-        model_status = check_local_model()
-    else:
-        model_status = {
-            "available": False,
-            "model": LOCAL_LLM_MODEL,
-            "message": "Cannot verify model because Ollama is unavailable."
-        }
-
-    knowledge_status = check_knowledge_base()
-
-    ollama_available = ollama_status["available"]
-
-    model_available = model_status["available"]
-
-    knowledge_available = knowledge_status["available"]
-
-    application_healthy = (
-        ollama_available
-        and model_available
-        and knowledge_available
-    )
-
-    response_data = {
-        "status": (
-            "healthy"
-            if application_healthy
-            else "unhealthy"
-        ),
-
+    healthy = ollama["available"] and model["available"] and knowledge["available"]
+    payload = {
+        "status": "healthy" if healthy else "unhealthy",
         "application": {
             "available": True,
-            "message": "Flask application is running."
+            "message": "PromptForge Flask application is running.",
         },
-
-        "ollama": ollama_status,
-
-        "local_model": model_status,
-
-        "knowledge_base": knowledge_status
+        "ollama": ollama,
+        "local_model": model,
+        "knowledge_base": knowledge,
     }
-
-    return jsonify(response_data), (
-        200 if application_healthy else 503
-    )
+    return jsonify(payload), (200 if healthy else 503)
 
 
-# ============================================================
-# 8. REQUEST VALIDATION
-# ============================================================
+@app.route("/api/knowledge/status", methods=["GET"])
+def knowledge_status():
+    """Return knowledge-base counts and validation state for diagnostics."""
+    status = get_knowledge_base_status()
+    return jsonify({
+        "status": "ready" if status["available"] else "error",
+        "knowledge_base": status,
+    }), (200 if status["available"] else 503)
 
-def validate_chat_request(data):
-    """
-    Validates incoming POST /api/chat JSON data.
-
-    Expected structure:
-
-    {
-        "message": "...",
-        "history": [],
-        "target_model": "gpt_luna",
-        "coding_mode": false
-    }
-
-    Returns:
-        tuple: (validated_data, error_message)
-    """
-
-    if not isinstance(data, dict):
-
-        return None, "Request body must be a JSON object."
-
-    # --------------------------------------------------------
-    # MESSAGE VALIDATION
-    # --------------------------------------------------------
-
-    message = data.get("message")
-
-    if not isinstance(message, str):
-
-        return None, "Message must be a string."
-
-    message = message.strip()
-
-    if not message:
-
-        return None, "Please enter a message before sending."
-
-    if len(message) > MAX_MESSAGE_LENGTH:
-
-        return None, (
-            f"Message exceeds the maximum allowed length "
-            f"of {MAX_MESSAGE_LENGTH} characters."
-        )
-
-    # --------------------------------------------------------
-    # TARGET MODEL VALIDATION
-    # --------------------------------------------------------
-
-    target_model = data.get("target_model")
-
-    if not isinstance(target_model, str):
-
-        return None, "Target model must be a string."
-
-    if target_model not in SUPPORTED_MODELS:
-
-        return None, (
-            "Invalid target model. Select either "
-            "'gpt_luna' or 'gemini_flash'."
-        )
-
-    # --------------------------------------------------------
-    # CODING MODE VALIDATION
-    # --------------------------------------------------------
-
-    coding_mode = data.get("coding_mode")
-
-    # Strict Boolean validation.
-    # Prevents accepting strings such as "true" or integers.
-    if type(coding_mode) is not bool:
-
-        return None, (
-            "coding_mode must be a Boolean value: "
-            "true or false."
-        )
-
-    # --------------------------------------------------------
-    # HISTORY VALIDATION
-    # --------------------------------------------------------
-
-    history = data.get("history", [])
-
-    if not isinstance(history, list):
-
-        return None, "Conversation history must be a list."
-
-    if len(history) > MAX_HISTORY_MESSAGES:
-
-        return None, (
-            f"Conversation history cannot exceed "
-            f"{MAX_HISTORY_MESSAGES} messages."
-        )
-
-    validated_history = []
-
-    for index, item in enumerate(history):
-
-        if not isinstance(item, dict):
-
-            return None, (
-                f"Invalid conversation history entry at "
-                f"position {index}."
-            )
-
-        role = item.get("role")
-        content = item.get("content")
-
-        if role not in SUPPORTED_ROLES:
-
-            return None, (
-                f"Invalid role in conversation history "
-                f"at position {index}."
-            )
-
-        if not isinstance(content, str):
-
-            return None, (
-                f"Invalid message content in conversation "
-                f"history at position {index}."
-            )
-
-        if len(content) > MAX_HISTORY_CONTENT_LENGTH:
-
-            return None, (
-                f"Conversation history message at position "
-                f"{index} exceeds the maximum length."
-            )
-
-        validated_history.append({
-            "role": role,
-            "content": content
-        })
-
-    # --------------------------------------------------------
-    # RETURN VALIDATED REQUEST
-    # --------------------------------------------------------
-
-    return {
-        "message": message,
-        "history": validated_history,
-        "target_model": target_model,
-        "coding_mode": coding_mode
-    }, None
-
-
-# ============================================================
-# 9. CHAT API ROUTE
-# ============================================================
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    """
-    Receives user messages and generates refined prompts
-    through prompt_engine.py.
-
-    Prompt-engineering logic is intentionally not implemented
-    inside this file.
-    """
-
-    # --------------------------------------------------------
-    # CHECK CONTENT TYPE
-    # --------------------------------------------------------
-
     if not request.is_json:
-
-        return error_response(
-            "Invalid request format. Please send JSON data.",
-            415
-        )
-
-    # --------------------------------------------------------
-    # PARSE JSON
-    # --------------------------------------------------------
+        return _error("Send the chat request as JSON.", 415)
 
     try:
-
-        data = request.get_json(silent=False)
-
+        payload = request.get_json(silent=False)
     except Exception:
+        return _error("Malformed JSON request.", 400)
 
-        return error_response(
-            "Malformed JSON request. Please check your data.",
-            400
-        )
-
-    if data is None:
-
-        return error_response(
-            "Request body cannot be empty.",
-            400
-        )
-
-    # --------------------------------------------------------
-    # VALIDATE REQUEST
-    # --------------------------------------------------------
-
-    validated_data, validation_error = validate_chat_request(
-        data
-    )
-
+    validated, validation_error = _validate_chat_payload(payload)
     if validation_error:
+        return _error(validation_error, 400)
 
-        return error_response(
-            validation_error,
-            400
-        )
-
-    message = validated_data["message"]
-
-    history = validated_data["history"]
-
-    target_model = validated_data["target_model"]
-
-    coding_mode = validated_data["coding_mode"]
-
-    logger.info(
-        "Processing prompt request | Model: %s | Coding: %s",
-        target_model,
-        coding_mode
+    LOGGER.info(
+        "Chat request | target_model=%s | coding_mode=%s | message_chars=%s",
+        validated["target_model"],
+        validated["coding_mode"],
+        len(validated["message"]),
     )
-
-    # --------------------------------------------------------
-    # CALL PROMPT ENGINE
-    # --------------------------------------------------------
 
     try:
-
         result = process_message(
-            message,
-            history,
-            target_model,
-            coding_mode
+            validated["message"],
+            validated["history"],
+            validated["target_model"],
+            validated["coding_mode"],
         )
-
-        # ----------------------------------------------------
-        # VALIDATE ENGINE RESPONSE
-        # ----------------------------------------------------
-
-        validated_response = validate_engine_response(
-            result
-        )
-
-        # ----------------------------------------------------
-        # RETURN STANDARDIZED RESPONSE
-        # ----------------------------------------------------
-
-        return jsonify(validated_response), 200
-
-    # --------------------------------------------------------
-    # TIMEOUT ERRORS
-    # --------------------------------------------------------
+        response = _validate_engine_result(result)
+        return jsonify(response), (200 if response["status"] != "error" else 422)
 
     except requests.exceptions.Timeout:
-
-        logger.error(
-            "Local AI request timed out."
-        )
-
-        return error_response(
-            "The local AI model took too long to respond. "
-            "Try again or increase the configured timeout.",
-            504
-        )
-
-    # --------------------------------------------------------
-    # CONNECTION ERRORS
-    # --------------------------------------------------------
-
+        LOGGER.warning("Request to local Ollama timed out.")
+        return _error("The local AI model timed out. Increase OLLAMA_TIMEOUT_SECONDS or use a smaller model.", 504)
     except requests.exceptions.ConnectionError:
-
-        logger.error(
-            "Cannot connect to the local AI service."
-        )
-
-        return error_response(
-            "Cannot connect to Ollama. Make sure the local "
-            "Ollama service is running.",
-            503
-        )
-
-    # --------------------------------------------------------
-    # OTHER REQUEST ERRORS
-    # --------------------------------------------------------
-
-    except requests.exceptions.RequestException as exc:
-
-        logger.error(
-            "Local AI communication error: %s",
-            exc
-        )
-
-        return error_response(
-            "An error occurred while communicating with "
-            "the local AI service.",
-            502
-        )
-
-    # --------------------------------------------------------
-    # INVALID ENGINE RESPONSE
-    # --------------------------------------------------------
-
+        LOGGER.warning("Cannot connect to Ollama.")
+        return _error("Cannot connect to Ollama. Start the local Ollama service.", 503)
     except ValueError as exc:
-
-        logger.error(
-            "Invalid prompt engine response: %s",
-            exc
-        )
-
-        return error_response(
-            "The prompt engine returned an invalid or "
-            "incomplete response. Please try again.",
-            500
-        )
-
-    # --------------------------------------------------------
-    # UNEXPECTED ERRORS
-    # --------------------------------------------------------
-
-    except Exception:
-
-        logger.exception(
-            "Unexpected error during prompt processing."
-        )
-
-        return error_response(
-            "An unexpected server error occurred while "
-            "processing your request.",
-            500
-        )
-
-
-# ============================================================
-# 10. GLOBAL ERROR HANDLERS
-# ============================================================
-
-@app.errorhandler(404)
-def not_found(error):
-
-    return error_response(
-        "The requested endpoint was not found.",
-        404
-    )
-
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-
-    return error_response(
-        "The requested HTTP method is not supported.",
-        405
-    )
+        LOGGER.exception("Invalid engine response.")
+        return _error(f"Prompt engine response validation failed: {exc}", 500)
+    except Exception as exc:
+        LOGGER.exception("Unexpected chat route error.")
+        return _error(f"Unexpected server error ({type(exc).__name__}). Check the terminal log.", 500)
 
 
 @app.errorhandler(413)
-def request_too_large(error):
+def request_too_large(_error_value):
+    return _error("The request is too large. Shorten the message or conversation history.", 413)
 
-    return error_response(
-        "Request is too large. Please reduce the message size.",
-        413
-    )
-
-
-@app.errorhandler(500)
-def internal_server_error(error):
-
-    logger.error(
-        "Internal server error: %s",
-        error
-    )
-
-    return error_response(
-        "An internal server error occurred.",
-        500
-    )
-
-
-# ============================================================
-# 11. APPLICATION ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-
-    logger.info("=" * 55)
-    logger.info("Starting PromptForge Offline")
-    logger.info("=" * 55)
-
-    logger.info(
-        "Local AI model: %s",
-        LOCAL_LLM_MODEL
-    )
-
-    logger.info(
-        "Ollama endpoint: %s",
-        OLLAMA_CHAT_URL
-    )
-
-    logger.info(
-        "Knowledge directory: %s",
-        KNOWLEDGE_DIR
-    )
-
-    logger.info(
-        "Application address: http://127.0.0.1:5000"
-    )
-
-    logger.info("=" * 55)
-
+    LOGGER.info("Starting PromptForge Offline.")
+    LOGGER.info("Knowledge base: %s", get_knowledge_base_status())
+    LOGGER.info("Configured local Ollama model: %s", LOCAL_LLM_MODEL or "(not set)")
     app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=False,
-        threaded=True
+        host=os.environ.get("FLASK_HOST", "127.0.0.1"),
+        port=int(os.environ.get("FLASK_PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true",
+        threaded=True,
     )
